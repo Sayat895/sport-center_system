@@ -4,7 +4,6 @@ import secrets
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
 from typing import Annotated
-from urllib.parse import parse_qs
 
 import bcrypt
 import redis.asyncio as redis
@@ -12,10 +11,7 @@ import requests
 from fastapi.concurrency import run_in_threadpool
 from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import RedirectResponse, Response as FastAPIResponse, StreamingResponse
-from google.auth.exceptions import GoogleAuthError
-from google.auth.transport.requests import Request as GoogleRequest
-from google.oauth2 import id_token
+from fastapi.responses import Response as FastAPIResponse, StreamingResponse
 from jose import JWTError, jwt
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
@@ -28,7 +24,7 @@ from openpyxl.worksheet.table import Table, TableStyleInfo
 
 from app.db import SessionLocal
 from app.models import Booking, Notification, Trainer, User, Workout
-from app.schemas import GoogleExchangeInput, GoogleLoginInput, LoginInput, NotificationOut, UserOut, UserUpdate, WorkoutCreate
+from app.schemas import GoogleLoginInput, LoginInput, NotificationOut, UserOut, UserUpdate, WorkoutCreate
 from app.seed import seed_database
 from app.settings import settings
 
@@ -154,28 +150,44 @@ async def login(data: LoginInput, session: DbSession):
 
 @app.post("/api/auth/google")
 async def google_login(data: GoogleLoginInput, session: DbSession):
-    return await authenticate_google_credential(data.credential, session)
-
-
-def google_redirect_error(error: str) -> RedirectResponse:
-    return RedirectResponse(f"/?google_error={error}", status_code=303, headers={"Cache-Control": "no-store"})
-
-
-async def authenticate_google_credential(credential: str, session: AsyncSession):
     if not settings.google_client_id:
         raise HTTPException(status_code=503, detail="Вход через Google пока не настроен")
     try:
-        claims = await run_in_threadpool(
-            id_token.verify_oauth2_token,
-            credential,
-            GoogleRequest(),
-            settings.google_client_id,
+        token_info_response = await run_in_threadpool(
+            requests.get,
+            "https://www.googleapis.com/oauth2/v1/tokeninfo",
+            params={"access_token": data.access_token},
+            timeout=10,
         )
-    except (GoogleAuthError, ValueError, requests.exceptions.RequestException):
+        if token_info_response.status_code != 200:
+            raise HTTPException(status_code=401, detail="Google не подтвердил access token")
+        token_info = token_info_response.json()
+        if not isinstance(token_info, dict):
+            raise HTTPException(status_code=401, detail="Google вернул некорректные данные токена")
+        token_audience = token_info.get("issued_to") or token_info.get("audience") or token_info.get("aud")
+        if token_audience != settings.google_client_id:
+            raise HTTPException(status_code=401, detail="Access token выпущен для другого приложения")
+
+        userinfo_response = await run_in_threadpool(
+            requests.get,
+            "https://www.googleapis.com/oauth2/v3/userinfo",
+            headers={"Authorization": f"Bearer {data.access_token}"},
+            timeout=10,
+        )
+        if userinfo_response.status_code != 200:
+            raise HTTPException(status_code=401, detail="Google не подтвердил аккаунт")
+        claims = userinfo_response.json()
+        if not isinstance(claims, dict):
+            raise HTTPException(status_code=401, detail="Google вернул некорректные данные аккаунта")
+    except requests.exceptions.RequestException:
         raise HTTPException(status_code=401, detail="Не удалось подтвердить аккаунт Google") from None
 
-    email = claims.get("email", "").lower()
-    full_name = claims.get("name", "").strip()
+    email = claims.get("email")
+    full_name = claims.get("name")
+    if isinstance(email, str):
+        email = email.strip().lower()
+    if isinstance(full_name, str):
+        full_name = full_name.strip()
     if not email or not full_name or claims.get("email_verified") is not True:
         raise HTTPException(status_code=401, detail="Google не подтвердил адрес электронной почты")
 
@@ -200,58 +212,6 @@ async def authenticate_google_credential(credential: str, session: AsyncSession)
             if not user or user.role != "client":
                 raise HTTPException(status_code=409, detail="Не удалось создать клиентский аккаунт") from None
     return {"access_token": create_token(user), "token_type": "bearer", "user": UserOut.model_validate(user)}
-
-
-@app.post("/api/auth/google/redirect")
-async def google_redirect_login(request: Request, session: DbSession):
-    try:
-        form = parse_qs((await request.body()).decode("utf-8"), max_num_fields=4)
-    except (UnicodeDecodeError, ValueError):
-        return google_redirect_error("invalid_response")
-
-    csrf_cookie = request.cookies.get("g_csrf_token")
-    csrf_form = form.get("g_csrf_token", [""])[0]
-    credential = form.get("credential", [""])[0]
-    if not csrf_cookie or csrf_cookie != csrf_form or not 20 <= len(credential) <= 8192:
-        return google_redirect_error("invalid_response")
-    if cache is None:
-        return google_redirect_error("unavailable")
-
-    try:
-        result = await authenticate_google_credential(credential, session)
-    except HTTPException as error:
-        error_code = {
-            401: "verification_failed",
-            403: "admin_not_allowed",
-            409: "account_conflict",
-            503: "unavailable",
-        }.get(error.status_code, "verification_failed")
-        return google_redirect_error(error_code)
-
-    code = secrets.token_urlsafe(32)
-    await cache.setex(f"google-login:{code}", 120, result["access_token"])
-    return RedirectResponse(f"/?google_login={code}", status_code=303, headers={"Cache-Control": "no-store"})
-
-
-@app.post("/api/auth/google/exchange")
-async def google_exchange(data: GoogleExchangeInput, session: DbSession, response: Response):
-    response.headers["Cache-Control"] = "no-store"
-    if cache is None:
-        raise HTTPException(status_code=503, detail="Сервис авторизации временно недоступен")
-
-    token = await cache.getdel(f"google-login:{data.code}")
-    if not token:
-        raise HTTPException(status_code=401, detail="Ссылка входа Google устарела. Попробуйте снова")
-    try:
-        payload = jwt.decode(token, settings.jwt_secret, algorithms=[ALGORITHM])
-        user_id = int(payload["sub"])
-    except (JWTError, KeyError, ValueError):
-        raise HTTPException(status_code=401, detail="Не удалось завершить вход через Google") from None
-
-    user = await session.get(User, user_id)
-    if not user or user.role != "client":
-        raise HTTPException(status_code=401, detail="Клиентский аккаунт Google не найден")
-    return {"access_token": token, "token_type": "bearer", "user": UserOut.model_validate(user)}
 
 
 @app.get("/api/auth/me", response_model=UserOut)

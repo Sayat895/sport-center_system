@@ -92,7 +92,8 @@ function App() {
   const [reportOpen, setReportOpen] = useState(false);
   const [report, setReport] = useState(null);
   const [googleUnavailable, setGoogleUnavailable] = useState(false);
-  const googleButtonRef = useRef(null);
+  const [googleReady, setGoogleReady] = useState(false);
+  const googleTokenClientRef = useRef(null);
   const [menuOpen, setMenuOpen] = useState(false);
   const [users, setUsers] = useState([]);
   const [adminBookings, setAdminBookings] = useState([]);
@@ -117,39 +118,6 @@ function App() {
     setToast(message);
     window.setTimeout(() => setToast(""), 3400);
   }, []);
-
-  useEffect(() => {
-    const params = new URLSearchParams(window.location.search);
-    const code = params.get("google_login");
-    const error = params.get("google_error");
-    if (!code && !error) return;
-    window.history.replaceState(null, "", `${window.location.pathname}${window.location.hash}`);
-    if (error) {
-      const errorMessages = {
-        invalid_response: "Google вернул некорректный ответ. Попробуйте войти снова.",
-        verification_failed: "Google не подтвердил аккаунт. Проверьте Client ID и разрешённый адрес сайта.",
-        admin_not_allowed: "Через Google можно войти только в клиентский аккаунт.",
-        account_conflict: "Не удалось создать клиентский аккаунт. Обратитесь к администратору.",
-        unavailable: "Сервис Google-входа временно недоступен. Попробуйте позже.",
-      };
-      notify(errorMessages[error] || "Не удалось завершить вход через Google.");
-      return;
-    }
-
-    fetch(`${API}/auth/google/exchange`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ code }),
-    }).then(async (response) => {
-      const body = await response.json();
-      if (!response.ok) throw new Error(body.detail || "Не удалось завершить вход через Google");
-      localStorage.setItem("sport-token", body.access_token);
-      setToken(body.access_token);
-      setUser(body.user);
-      setLoginOpen(false);
-      notify(`Добро пожаловать, ${body.user.full_name.split(" ")[0]}!`);
-    }).catch((error) => notify(error.message || "Не удалось завершить вход через Google"));
-  }, [notify]);
 
   const refresh = useCallback(async () => {
     try {
@@ -217,23 +185,55 @@ function App() {
     } catch (error) { notify(error.message); }
   }
 
+  const loginWithGoogle = useCallback(async (tokenResponse) => {
+    if (tokenResponse.error || !tokenResponse.access_token) {
+      notify("Вход через Google отменён или не был подтверждён.");
+      return;
+    }
+    try {
+      const response = await fetch(`${API}/auth/google`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ access_token: tokenResponse.access_token }),
+      });
+      const body = await response.json();
+      if (!response.ok) throw new Error(body.detail || "Не удалось войти через Google");
+      localStorage.setItem("sport-token", body.access_token);
+      setToken(body.access_token); setUser(body.user); setLoginOpen(false);
+      notify(`Добро пожаловать, ${body.user.full_name.split(" ")[0]}!`);
+    } catch (error) { notify(error.message || "Не удалось войти через Google"); }
+  }, [notify]);
+
   useEffect(() => {
-    if (!loginOpen || !googleClientId || !googleButtonRef.current) return undefined;
+    if (!loginOpen || !googleClientId) {
+      googleTokenClientRef.current = null;
+      setGoogleReady(false);
+      return undefined;
+    }
     let active = true;
-    const renderGoogleButton = () => {
-      if (!active || !window.google?.accounts?.id || !googleButtonRef.current) return;
-      window.google.accounts.id.initialize({
-        client_id: googleClientId,
-        ux_mode: "redirect",
-        login_uri: `${window.location.origin}/api/auth/google/redirect`,
-      });
-      window.google.accounts.id.renderButton(googleButtonRef.current, {
-        theme: "filled_black", size: "large", shape: "pill", text: "continue_with", width: 350, locale: "ru",
-      });
-      setGoogleUnavailable(false);
+    setGoogleReady(false);
+    setGoogleUnavailable(false);
+    const initializeTokenClient = () => {
+      if (!active || !window.google?.accounts?.oauth2) return;
+      try {
+        googleTokenClientRef.current = window.google.accounts.oauth2.initTokenClient({
+          client_id: googleClientId,
+          scope: "openid email profile",
+          callback: loginWithGoogle,
+          error_callback: (error) => {
+            if (error?.type === "popup_closed") notify("Окно Google было закрыто. Нажмите кнопку, чтобы попробовать снова.");
+            else if (error?.type === "popup_failed_to_open") notify("Браузер заблокировал окно Google. Разрешите всплывающие окна и попробуйте снова.");
+            else notify("Не удалось открыть вход Google. Попробуйте ещё раз.");
+          },
+        });
+        setGoogleReady(true);
+        setGoogleUnavailable(false);
+      } catch {
+        setGoogleUnavailable(true);
+      }
     };
-    if (window.google?.accounts?.id) {
-      renderGoogleButton();
+    if (window.google?.accounts?.oauth2) {
+      initializeTokenClient();
     } else {
       let script = document.querySelector('script[src="https://accounts.google.com/gsi/client"]');
       if (!script) {
@@ -241,16 +241,31 @@ function App() {
         script.src = "https://accounts.google.com/gsi/client";
         script.async = true;
         script.defer = true;
-        script.onload = renderGoogleButton;
+        script.onload = initializeTokenClient;
         script.onerror = () => active && setGoogleUnavailable(true);
         document.head.appendChild(script);
       } else {
-        script.addEventListener("load", renderGoogleButton, { once: true });
+        script.addEventListener("load", initializeTokenClient, { once: true });
         script.addEventListener("error", () => active && setGoogleUnavailable(true), { once: true });
       }
     }
-    return () => { active = false; };
-  }, [loginOpen]);
+    return () => {
+      active = false;
+      googleTokenClientRef.current = null;
+    };
+  }, [loginOpen, loginWithGoogle, notify]);
+
+  function requestGoogleAccessToken() {
+    if (!googleTokenClientRef.current) {
+      setGoogleUnavailable(true);
+      return;
+    }
+    try {
+      googleTokenClientRef.current.requestAccessToken({ prompt: "select_account" });
+    } catch {
+      notify("Не удалось открыть окно Google. Разрешите всплывающие окна и попробуйте снова.");
+    }
+  }
 
   async function book(item) {
     if (!user) { setLoginOpen(true); return; }
@@ -431,7 +446,7 @@ function App() {
         <button onClick={() => setLoginOpen(false)} className="icon-btn absolute right-4 top-4" aria-label="Закрыть"><X size={18} /></button>
         <div className="mb-5 grid h-12 w-12 place-items-center rounded-xl bg-lime-400 text-zinc-950"><Activity /></div><h2 className="text-2xl font-black">С возвращением</h2><p className="mb-5 mt-1 text-sm text-zinc-500">Войдите, чтобы выбрать свою тренировку.</p>
         <div className="google-login">
-          {googleClientId ? <><div ref={googleButtonRef} className="google-button" /><p>Войти или зарегистрироваться как клиент</p>{googleUnavailable && <p className="google-error">Google Sign-In не загрузился. Откройте сайт в обычном браузере и проверьте подключение к интернету.</p>}</> :
+          {googleClientId ? <><button type="button" className="google-oauth-button" onClick={requestGoogleAccessToken} disabled={!googleReady}><span className="google-oauth-mark">G</span>Продолжить с Google</button><p>Вход или автоматическая регистрация клиентского аккаунта</p>{googleUnavailable && <p className="google-error" role="alert">Google Sign-In не загрузился. Откройте сайт в обычном браузере и проверьте подключение к интернету.</p>}</> :
             <div className="google-setup"><span className="google-g">G</span><div><strong>Продолжить с Google</strong><p>Первый вход автоматически создаст клиентский аккаунт. Для подключения нужен Google OAuth Client ID.</p></div></div>}
         </div>
         <div className="login-divider"><span />или по email<span /></div>

@@ -9,11 +9,7 @@ class LoginInput(BaseModel):
 
 
 class GoogleLoginInput(BaseModel):
-    credential: str = Field(min_length=20, max_length=8192)
-
-
-class GoogleExchangeInput(BaseModel):
-    code: str = Field(min_length=32, max_length=128)
+    access_token: str = Field(min_length=20, max_length=8192)
 
 
 class UserOut(BaseModel):

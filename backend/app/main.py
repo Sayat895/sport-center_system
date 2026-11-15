@@ -556,11 +556,12 @@ def build_report_workbook(report: dict) -> bytes:
             cell.fill = PatternFill("solid", fgColor="65A30D")
             cell.alignment = Alignment(vertical="center", wrap_text=True)
         sheet.freeze_panes = "A3"
-        sheet.auto_filter.ref = f"A2:{sheet.cell(row=max(2, sheet.max_row), column=len(headers)).coordinate}"
         if rows:
             table = Table(displayName=f"ReportTable{index + 1}", ref=f"A2:{sheet.cell(row=sheet.max_row, column=len(headers)).coordinate}")
             table.tableStyleInfo = TableStyleInfo(name="TableStyleMedium4", showFirstColumn=False, showLastColumn=False, showRowStripes=True, showColumnStripes=False)
             sheet.add_table(table)
+        else:
+            sheet.auto_filter.ref = f"A2:{sheet.cell(row=2, column=len(headers)).coordinate}"
         for column_index, column in enumerate(sheet.columns, start=1):
             column_letter = get_column_letter(column_index)
             width = max((len(str(cell.value or "")) for cell in column), default=10)

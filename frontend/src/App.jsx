@@ -1,13 +1,52 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
-  Activity, ArrowRight, Bell, CalendarDays, Check, Clock3, Dumbbell, LogOut,
-  Menu, Plus, Search, ShieldCheck, Waves, X, Zap,
+  Activity, ArrowRight, Bell, CalendarDays, Check, ChevronDown, Clock3, Download,
+  Dumbbell, FileSpreadsheet, LogOut, Menu, Plus, ShieldCheck, Waves, X, Zap,
 } from "lucide-react";
 
 const API = "/api";
 const sports = ["Все направления", "Тренажерный зал", "Бассейн", "Бокс", "Йога", "Кроссфит"];
 const iconBySport = { "Тренажерный зал": Dumbbell, "Бассейн": Waves, "Бокс": Activity, "Йога": Activity, "Кроссфит": Zap };
 const localDate = (date) => `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
+const googleClientId = import.meta.env.VITE_GOOGLE_CLIENT_ID || "";
+
+function SelectField({ value, options, onChange, className = "", placeholder = "Выберите" }) {
+  const [open, setOpen] = useState(false);
+  const rootRef = useRef(null);
+  const selected = options.find((option) => String(option.value) === String(value));
+
+  useEffect(() => {
+    if (!open) return undefined;
+    const closeOnOutsideClick = (event) => {
+      if (!rootRef.current?.contains(event.target)) setOpen(false);
+    };
+    document.addEventListener("pointerdown", closeOnOutsideClick);
+    return () => document.removeEventListener("pointerdown", closeOnOutsideClick);
+  }, [open]);
+
+  return <div ref={rootRef} className={`select-root ${open ? "select-root-open" : ""} ${className}`} onKeyDown={(event) => event.key === "Escape" && setOpen(false)}>
+    <button type="button" className={`field select-trigger ${open ? "select-trigger-open" : ""}`} aria-haspopup="listbox" aria-expanded={open} onClick={() => setOpen((current) => !current)}>
+      <span className={selected ? "" : "select-placeholder"}>{selected?.label || placeholder}</span><ChevronDown size={16} className={`select-chevron ${open ? "select-chevron-open" : ""}`} />
+    </button>
+    {open && <div className="select-menu" role="listbox">
+      {options.map((option) => <button key={option.value} type="button" role="option" aria-selected={String(option.value) === String(value)} className={`select-option ${String(option.value) === String(value) ? "select-option-active" : ""}`} onClick={() => { onChange(option.value); setOpen(false); }}>
+        <span>{option.label}</span>{String(option.value) === String(value) && <Check size={15} />}
+      </button>)}
+      {!options.length && <span className="select-empty">Нет вариантов</span>}
+    </div>}
+  </div>;
+}
+
+function ReportTable({ columns, rows, emptyMessage }) {
+  return <div className="report-table-scroll">
+    <table className="report-table">
+      <thead><tr>{columns.map((column) => <th key={column.key} className={column.numeric ? "text-right" : ""}>{column.label}</th>)}</tr></thead>
+      <tbody>{rows.length ? rows.map((row, index) => <tr key={row.id || `${row.date || row.name || row.title || "row"}-${index}`}>
+        {columns.map((column) => <td key={column.key} className={column.numeric ? "text-right tabular-nums" : ""}>{column.render ? column.render(row[column.key], row) : row[column.key]}</td>)}
+      </tr>) : <tr><td className="report-empty" colSpan={columns.length}>{emptyMessage}</td></tr>}</tbody>
+    </table>
+  </div>;
+}
 
 function App() {
   const [token, setToken] = useState(localStorage.getItem("sport-token") || "");
@@ -19,6 +58,10 @@ function App() {
   const [tab, setTab] = useState("schedule");
   const [toast, setToast] = useState("");
   const [loginOpen, setLoginOpen] = useState(false);
+  const [reportOpen, setReportOpen] = useState(false);
+  const [report, setReport] = useState(null);
+  const [googleUnavailable, setGoogleUnavailable] = useState(false);
+  const googleButtonRef = useRef(null);
   const [menuOpen, setMenuOpen] = useState(false);
   const [users, setUsers] = useState([]);
   const [adminBookings, setAdminBookings] = useState([]);
@@ -39,10 +82,10 @@ function App() {
     return response;
   }, [token]);
 
-  const notify = (message) => {
+  const notify = useCallback((message) => {
     setToast(message);
     window.setTimeout(() => setToast(""), 3400);
-  };
+  }, []);
 
   const refresh = useCallback(async () => {
     try {
@@ -110,6 +153,55 @@ function App() {
     } catch (error) { notify(error.message); }
   }
 
+  const loginWithGoogle = useCallback(async (credential) => {
+    try {
+      const response = await fetch(`${API}/auth/google`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ credential }),
+      });
+      const body = await response.json();
+      if (!response.ok) throw new Error(body.detail || "Не удалось войти через Google");
+      localStorage.setItem("sport-token", body.access_token);
+      setToken(body.access_token); setUser(body.user); setLoginOpen(false);
+      notify(`Добро пожаловать, ${body.user.full_name.split(" ")[0]}!`);
+    } catch (error) { notify(error.message); }
+  }, [notify]);
+
+  useEffect(() => {
+    if (!loginOpen || !googleClientId || !googleButtonRef.current) return undefined;
+    let active = true;
+    const renderGoogleButton = () => {
+      if (!active || !window.google?.accounts?.id || !googleButtonRef.current) return;
+      window.google.accounts.id.initialize({
+        client_id: googleClientId,
+        callback: (response) => loginWithGoogle(response.credential),
+      });
+      window.google.accounts.id.renderButton(googleButtonRef.current, {
+        theme: "filled_black", size: "large", shape: "pill", text: "continue_with", width: 350, locale: "ru",
+      });
+      setGoogleUnavailable(false);
+    };
+    if (window.google?.accounts?.id) {
+      renderGoogleButton();
+    } else {
+      let script = document.querySelector('script[src="https://accounts.google.com/gsi/client"]');
+      if (!script) {
+        script = document.createElement("script");
+        script.src = "https://accounts.google.com/gsi/client";
+        script.async = true;
+        script.defer = true;
+        script.onload = renderGoogleButton;
+        script.onerror = () => active && setGoogleUnavailable(true);
+        document.head.appendChild(script);
+      } else {
+        script.addEventListener("load", renderGoogleButton, { once: true });
+        script.addEventListener("error", () => active && setGoogleUnavailable(true), { once: true });
+      }
+    }
+    return () => { active = false; };
+  }, [loginOpen, loginWithGoogle]);
+
   async function book(item) {
     if (!user) { setLoginOpen(true); return; }
     try { await request(`/workouts/${item.id}/book`, { method: "POST" }); notify("Вы записаны на тренировку!"); await refresh(); }
@@ -144,14 +236,28 @@ function App() {
     } catch (error) { notify(error.message); }
   }
 
-  async function downloadReport() {
+  async function viewReport() {
     try {
-      const response = await request("/admin/report.csv");
+      const response = await request("/admin/report");
+      setReport(await response.json());
+      setReportOpen(true);
+    } catch (error) { notify(error.message); }
+  }
+
+  async function downloadReport(format = "xlsx") {
+    try {
+      const extension = format === "csv" ? "csv" : "xlsx";
+      const response = await request(`/admin/report.${extension}`);
       const blob = await response.blob();
       const url = URL.createObjectURL(blob);
-      const anchor = document.createElement("a"); anchor.href = url; anchor.download = "sport-center-report.csv"; anchor.click();
-      URL.revokeObjectURL(url);
-      notify("CSV-отчет сформирован");
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = `sport-center-report.${extension}`;
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+      notify(extension === "csv" ? "CSV-отчет сформирован" : "Оформленный Excel-отчет сформирован");
     } catch (error) { notify(error.message); }
   }
 
@@ -224,30 +330,64 @@ function App() {
         </>}
 
         {tab === "account" && <section><div className="mb-7"><p className="section-kicker">ЛИЧНОЕ ПРОСТРАНСТВО</p><h1 className="mt-1 text-3xl font-black">Мой кабинет</h1></div><div className="grid gap-5 lg:grid-cols-[1.2fr_.8fr]">
-          <div className="panel p-5 sm:p-7"><h2 className="mb-4 flex items-center gap-2 text-lg font-bold"><CalendarDays className="text-lime-400" size={19} />Мои тренировки</h2>{bookings.length ? <div className="space-y-3">{bookings.map((item) => <div key={item.id} className="flex flex-wrap items-center justify-between gap-3 rounded-xl bg-zinc-900 p-4"><div><div className="font-semibold">{item.sport}</div><div className="mt-1 text-xs text-zinc-500">{item.date.split("-").reverse().join(".")} · {item.start_time} · {item.trainer}</div></div><button className="text-xs text-red-400 hover:text-red-300" onClick={() => cancel(item.id)}>Отменить запись</button></div>)}</div> : <p className="text-sm text-zinc-500">Пока нет активных записей. Выберите тренировку в расписании.</p>}</div>
-          <div className="panel p-5 sm:p-7"><h2 className="mb-4 flex items-center gap-2 text-lg font-bold"><Bell className="text-lime-400" size={19} />Уведомления <span className="rounded-full bg-zinc-800 px-2 py-0.5 text-xs text-zinc-400">{notifications.length}</span></h2>{notifications.length ? <div className="space-y-3">{notifications.map((item) => <div key={item.id} className="rounded-xl border border-blue-500/10 bg-blue-500/5 p-3 text-sm text-zinc-300"><p>{item.message}</p><time className="mt-2 block text-[11px] text-zinc-600">{new Date(item.created_at).toLocaleString("ru-RU")}</time></div>)}</div> : <p className="text-sm text-zinc-500">Важные сообщения появятся здесь.</p>}</div>
+          <div className="panel p-5 sm:p-7"><h2 className="mb-4 flex items-center gap-2 text-lg font-bold"><CalendarDays className="text-lime-400" size={19} />Мои тренировки</h2>{bookings.length ? <div className="client-booking-list">{bookings.map((item) => <div key={item.id} className="client-booking-row"><span className="client-booking-sport">{item.sport}</span><span className="client-booking-meta">{item.date.split("-").reverse().join(".")} · {item.start_time} · {item.trainer}</span><button className="client-booking-cancel" onClick={() => cancel(item.id)}>Отменить запись</button></div>)}</div> : <p className="empty-state">Пока нет активных записей. Выберите тренировку в расписании.</p>}</div>
+          <div className="panel p-5 sm:p-7"><h2 className="mb-4 flex items-center gap-2 text-lg font-bold"><Bell className="text-lime-400" size={19} />Уведомления <span className="rounded-full bg-zinc-800 px-2 py-0.5 text-xs text-zinc-400">{notifications.length}</span></h2>{notifications.length ? <div className="notification-list">{notifications.map((item) => <div key={item.id} className="notification-row"><p>{item.message}</p><time>{new Date(item.created_at).toLocaleString("ru-RU")}</time></div>)}</div> : <p className="empty-state">Важные сообщения появятся здесь.</p>}</div>
         </div></section>}
 
         {tab === "admin" && user?.role === "admin" && <section>
-          <div className="mb-7 flex flex-wrap items-end justify-between gap-4"><div><p className="section-kicker">УПРАВЛЕНИЕ ЦЕНТРОМ</p><h1 className="mt-1 text-3xl font-black">Админ-панель</h1></div><button onClick={downloadReport} className="rounded-xl bg-blue-500 px-4 py-2.5 text-sm font-bold text-white transition hover:bg-blue-400"><Activity className="mr-2 inline" size={16} />Сформировать отчет CSV</button></div>
+          <div className="mb-7 flex flex-wrap items-end justify-between gap-4"><div><p className="section-kicker">УПРАВЛЕНИЕ ЦЕНТРОМ</p><h1 className="mt-1 text-3xl font-black">Админ-панель</h1></div><div className="flex flex-wrap gap-2"><button onClick={viewReport} className="rounded-xl border border-white/10 bg-zinc-900 px-4 py-2.5 text-sm font-bold text-white transition hover:border-lime-400/40 hover:text-lime-300"><Activity className="mr-2 inline" size={16} />Посмотреть отчет</button><button onClick={() => downloadReport("xlsx")} className="rounded-xl bg-lime-400 px-4 py-2.5 text-sm font-bold text-zinc-950 transition hover:bg-lime-300"><FileSpreadsheet className="mr-2 inline" size={16} />Скачать Excel</button><button onClick={() => downloadReport("csv")} className="rounded-xl bg-blue-500 px-4 py-2.5 text-sm font-bold text-white transition hover:bg-blue-400"><Download className="mr-2 inline" size={16} />CSV</button></div></div>
           <div className="mb-6 grid gap-3 sm:grid-cols-3"><div className="stat-card"><span>Пользователи</span><strong>{users.length}</strong><span className="text-lime-400">в системе</span></div><div className="stat-card"><span>Тренировки</span><strong>{workouts.length}</strong><span className="text-blue-400">в расписании</span></div><div className="stat-card"><span>Активные записи</span><strong>{adminBookings.length}</strong><span className="text-lime-400">всего</span></div></div>
           <div className="mb-6 panel p-5 sm:p-6"><h2 className="mb-4 flex items-center gap-2 font-bold"><Plus size={18} className="text-lime-400" />Добавить тренировку</h2><form onSubmit={addWorkout} className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
             <input className="field" placeholder="Название" value={trainingForm.title} onChange={(e) => setTrainingForm({ ...trainingForm, title: e.target.value })} required />
-            <select className="field" value={trainingForm.sport} onChange={(e) => setTrainingForm({ ...trainingForm, sport: e.target.value })}>{sports.slice(1).map((sport) => <option key={sport}>{sport}</option>)}</select>
-            <select className="field" value={trainingForm.trainer_id} onChange={(e) => setTrainingForm({ ...trainingForm, trainer_id: e.target.value })}><option value="">Выберите тренера</option>{trainers.map((trainer) => <option key={trainer.id} value={trainer.id}>{trainer.full_name}</option>)}</select>
+            <SelectField className="training-select" value={trainingForm.sport} onChange={(value) => setTrainingForm({ ...trainingForm, sport: value })} options={sports.slice(1).map((sport) => ({ value: sport, label: sport }))} placeholder="Выберите направление" />
+            <SelectField className="training-select" value={trainingForm.trainer_id} onChange={(value) => setTrainingForm({ ...trainingForm, trainer_id: value })} options={trainers.map((trainer) => ({ value: String(trainer.id), label: trainer.full_name }))} placeholder="Выберите тренера" />
             <input className="field" type="date" value={trainingForm.date} onChange={(e) => setTrainingForm({ ...trainingForm, date: e.target.value })} required />
             <input className="field" type="time" value={trainingForm.start_time} onChange={(e) => setTrainingForm({ ...trainingForm, start_time: e.target.value })} required />
             <input className="field" type="number" min="1" max="100" placeholder="Мест" value={trainingForm.capacity} onChange={(e) => setTrainingForm({ ...trainingForm, capacity: e.target.value })} required />
-            <select className="field" value={trainingForm.difficulty} onChange={(e) => setTrainingForm({ ...trainingForm, difficulty: e.target.value })}><option>Начальный</option><option>Средний</option><option>Продвинутый</option></select>
+            <SelectField className="training-select" value={trainingForm.difficulty} onChange={(value) => setTrainingForm({ ...trainingForm, difficulty: value })} options={["Начальный", "Средний", "Продвинутый"].map((level) => ({ value: level, label: level }))} placeholder="Сложность" />
             <button className="rounded-xl bg-lime-400 px-4 py-2 text-sm font-bold text-zinc-950 hover:bg-lime-300">Добавить в расписание</button>
           </form></div>
-          <div className="panel overflow-hidden"><div className="flex items-center justify-between border-b border-white/5 p-5"><h2 className="font-bold">Пользователи</h2><span className="text-xs text-zinc-500">{users.length} записей</span></div><div className="overflow-x-auto"><table className="w-full min-w-[740px] text-left text-sm"><thead className="text-xs uppercase tracking-wider text-zinc-600"><tr><th className="px-5 py-3">ФИО / Email</th><th className="px-3 py-3">Телефон</th><th className="px-3 py-3">Абонемент</th><th className="px-3 py-3">Роль</th><th className="px-4 py-3">Действие</th></tr></thead><tbody>{users.map((person) => <tr key={person.id} className="border-t border-white/5"><td className="px-5 py-3"><div className="font-semibold">{savingUser?.id === person.id ? <input className="field w-40 py-1" value={savingUser.full_name} onChange={(e) => setSavingUser({ ...savingUser, full_name: e.target.value })} /> : person.full_name}</div><div className="text-xs text-zinc-500">{person.email}</div></td><td className="px-3 py-3 text-zinc-400">{savingUser?.id === person.id ? <input className="field w-32 py-1" value={savingUser.phone} onChange={(e) => setSavingUser({ ...savingUser, phone: e.target.value })} /> : person.phone}</td><td className="px-3 py-3"><select className="field py-1" value={savingUser?.id === person.id ? savingUser.membership : person.membership} onChange={(e) => savingUser?.id === person.id ? setSavingUser({ ...savingUser, membership: e.target.value }) : setSavingUser({ ...person, membership: e.target.value })}><option>Стандарт</option><option>Премиум</option><option>Утренний</option></select></td><td className="px-3 py-3"><select className="field py-1" value={savingUser?.id === person.id ? savingUser.role : person.role} onChange={(e) => setSavingUser({ ...(savingUser?.id === person.id ? savingUser : person), role: e.target.value })}><option value="client">Клиент</option><option value="admin">Админ</option></select></td><td className="px-4 py-3"><button className="text-xs font-semibold text-lime-400 hover:text-lime-300" onClick={() => savingUser?.id === person.id ? saveUser(savingUser) : setSavingUser({ ...person })}>{savingUser?.id === person.id ? "Сохранить" : "Изменить"}</button></td></tr>)}</tbody></table></div></div>
-          <div className="mt-6 panel p-5"><h2 className="mb-4 font-bold">Записи клиентов — отмена администратором</h2><div className="grid gap-2 md:grid-cols-2">{adminBookings.map((booking) => <div key={booking.id} className="flex items-center justify-between gap-3 rounded-lg bg-zinc-900 p-3 text-sm"><span>{booking.date} · {booking.start_time} · {booking.sport}<span className="block text-xs text-zinc-500">{booking.user_name} · {booking.workout_title}</span></span><button className="rounded-lg bg-red-500/10 px-2 py-1 text-[11px] text-red-300 hover:bg-red-500/20" onClick={() => cancel(booking.id)}>Отменить</button></div>)}</div>{adminBookings.length === 0 && <p className="text-sm text-zinc-500">Активных записей нет.</p>}<p className="mt-3 text-xs text-zinc-600">Клиент получит уведомление в личном кабинете после отмены.</p></div>
+          <div className="panel overflow-hidden"><div className="flex items-center justify-between border-b border-white/5 p-5"><h2 className="font-bold">Пользователи</h2><span className="text-xs text-zinc-500">{users.length} записей</span></div><div className="overflow-x-auto"><table className="admin-table w-full min-w-[740px] text-left text-sm"><thead className="text-xs uppercase tracking-wider text-zinc-600"><tr><th className="px-5 py-3">ФИО / Email</th><th className="px-3 py-3">Телефон</th><th className="px-3 py-3">Абонемент</th><th className="px-3 py-3">Роль</th><th className="px-4 py-3">Действие</th></tr></thead><tbody>{users.map((person) => <tr key={person.id} className="border-t border-white/5"><td className="px-5 py-3"><div className="font-semibold">{savingUser?.id === person.id ? <input className="field w-40 py-1" value={savingUser.full_name} onChange={(e) => setSavingUser({ ...savingUser, full_name: e.target.value })} /> : person.full_name}</div><div className="text-xs text-zinc-500">{person.email}</div></td><td className="px-3 py-3 text-zinc-400">{savingUser?.id === person.id ? <input className="field w-32 py-1" value={savingUser.phone} onChange={(e) => setSavingUser({ ...savingUser, phone: e.target.value })} /> : person.phone}</td><td className="px-3 py-3"><select className="field py-1" value={savingUser?.id === person.id ? savingUser.membership : person.membership} onChange={(e) => savingUser?.id === person.id ? setSavingUser({ ...savingUser, membership: e.target.value }) : setSavingUser({ ...person, membership: e.target.value })}><option>Стандарт</option><option>Премиум</option><option>Утренний</option></select></td><td className="px-3 py-3"><select className="field py-1" value={savingUser?.id === person.id ? savingUser.role : person.role} onChange={(e) => setSavingUser({ ...(savingUser?.id === person.id ? savingUser : person), role: e.target.value })}><option value="client">Клиент</option><option value="admin">Админ</option></select></td><td className="px-4 py-3"><button className="rounded-lg px-2 py-1 text-xs font-semibold text-lime-400 transition hover:bg-lime-400/10 hover:text-lime-300" onClick={() => savingUser?.id === person.id ? saveUser(savingUser) : setSavingUser({ ...person })}>{savingUser?.id === person.id ? "Сохранить" : "Изменить"}</button></td></tr>)}</tbody></table></div></div>
+          <div className="mt-6 panel p-5"><div className="mb-4 flex items-center justify-between"><h2 className="font-bold">Записи клиентов — отмена администратором</h2><span className="rounded-full bg-zinc-800 px-2.5 py-1 text-xs text-zinc-400">{adminBookings.length} записей</span></div><div className="grid gap-3 md:grid-cols-2">{adminBookings.map((booking) => <div key={booking.id} className="booking-list-row"><span className="booking-date">{booking.date.split("-").reverse().join(".")} · {booking.start_time}</span><span className="booking-sport">{booking.sport}</span><span className="booking-name">{booking.user_name}</span><span className="booking-title">{booking.workout_title}</span><button className="booking-cancel" onClick={() => cancel(booking.id)}>Отменить</button></div>)}</div>{adminBookings.length === 0 && <p className="empty-state">Активных записей нет.</p>}<p className="mt-3 text-xs text-zinc-600">Клиент получит уведомление в личном кабинете после отмены.</p></div>
         </section>}
       </main>
       <footer className="border-t border-white/5 px-4 py-6 text-center text-xs text-zinc-600">© {new Date().getFullYear()} SPORTCLUB · Стань сильнее сегодня</footer>
 
-      {loginOpen && <div className="modal-backdrop" onMouseDown={(e) => e.target === e.currentTarget && setLoginOpen(false)}><div className="modal-card"><button onClick={() => setLoginOpen(false)} className="icon-btn absolute right-4 top-4"><X size={18} /></button><div className="mb-5 grid h-12 w-12 place-items-center rounded-xl bg-lime-400 text-zinc-950"><Activity /></div><h2 className="text-2xl font-black">С возвращением</h2><p className="mb-5 mt-1 text-sm text-zinc-500">Войдите, чтобы выбрать свою тренировку.</p><form onSubmit={(e) => login(e)} className="space-y-3"><input className="field w-full" type="email" placeholder="Email" value={loginForm.email} onChange={(e) => setLoginForm({ ...loginForm, email: e.target.value })} required /><input className="field w-full" type="password" placeholder="Пароль" value={loginForm.password} onChange={(e) => setLoginForm({ ...loginForm, password: e.target.value })} required /><button className="w-full rounded-xl bg-lime-400 py-3 font-bold text-zinc-950 hover:bg-lime-300">Войти</button></form><div className="my-4 flex items-center gap-2 text-[10px] uppercase tracking-wider text-zinc-600"><span className="h-px flex-1 bg-zinc-800" />Быстрый демо-вход<span className="h-px flex-1 bg-zinc-800" /></div><div className="grid grid-cols-2 gap-2"><button className="rounded-xl border border-white/10 py-2.5 text-xs font-semibold hover:bg-white/5" onClick={(e) => login(e, "client")}>Войти как клиент</button><button className="rounded-xl border border-white/10 py-2.5 text-xs font-semibold hover:bg-white/5" onClick={(e) => login(e, "admin")}>Войти как админ</button></div></div></div>}
+      {reportOpen && report && <div className="modal-backdrop report-backdrop" onMouseDown={(event) => event.target === event.currentTarget && setReportOpen(false)}>
+        <section className="report-dialog" role="dialog" aria-modal="true" aria-labelledby="report-title">
+          <header className="report-header"><div><p className="section-kicker">АНАЛИТИКА СПОРТЦЕНТРА</p><h2 id="report-title" className="mt-1 text-2xl font-black">Отчет по расписанию и записям</h2><p className="mt-1 text-xs text-zinc-500">Сформирован: {new Date(report.generated_at).toLocaleString("ru-RU")}</p></div><button className="icon-btn" onClick={() => setReportOpen(false)} aria-label="Закрыть отчет"><X size={18} /></button></header>
+          <div className="report-content">
+            <div className="report-summary">
+              <div className="report-stat"><span>Активных записей</span><strong>{report.summary.total_bookings}</strong></div>
+              <div className="report-stat"><span>Клиентов</span><strong>{report.summary.total_clients}</strong></div>
+              <div className="report-stat"><span>Тренеров</span><strong>{report.summary.total_trainers}</strong></div>
+              <div className="report-stat"><span>Предстоящих занятий</span><strong>{report.summary.total_workouts}</strong></div>
+            </div>
+            <section className="report-section"><div className="report-section-title"><div><h3>Загрузка по тренерам</h3><p>Количество занятий, записей и оставшихся мест</p></div><span>{report.trainers.length} тренеров</span></div>
+              <ReportTable columns={[{ key: "name", label: "Тренер" }, { key: "training_count", label: "Занятий", numeric: true }, { key: "bookings", label: "Записей", numeric: true }, { key: "capacity", label: "Всего мест", numeric: true }, { key: "available", label: "Свободно", numeric: true }]} rows={report.trainers} emptyMessage="Данных о тренерах пока нет." />
+            </section>
+            <section className="report-section"><div className="report-section-title"><div><h3>Популярность направлений</h3><p>Спрос на занятия и заполненность групп</p></div><span>{report.sports.length} направлений</span></div>
+              <ReportTable columns={[{ key: "name", label: "Направление" }, { key: "training_count", label: "Занятий", numeric: true }, { key: "bookings", label: "Записей", numeric: true }, { key: "capacity", label: "Всего мест", numeric: true }, { key: "available", label: "Свободно", numeric: true }]} rows={report.sports} emptyMessage="Направлений пока нет." />
+            </section>
+            <section className="report-section"><div className="report-section-title"><div><h3>Подробное расписание</h3><p>Свободные места и тренер для каждого занятия</p></div><span>{report.schedule.length} занятий</span></div>
+              <ReportTable columns={[{ key: "date", label: "Дата", render: (value) => value.split("-").reverse().join(".") }, { key: "time", label: "Время" }, { key: "sport", label: "Направление" }, { key: "title", label: "Занятие" }, { key: "trainer", label: "Тренер" }, { key: "booked", label: "Записано", numeric: true }, { key: "capacity", label: "Мест", numeric: true }, { key: "available", label: "Свободно", numeric: true }]} rows={report.schedule} emptyMessage="Расписание пока пустое." />
+            </section>
+          </div>
+          <footer className="report-footer"><button className="report-download-secondary" onClick={() => downloadReport("csv")}><Download size={16} /> Скачать CSV</button><button className="report-download" onClick={() => downloadReport("xlsx")}><FileSpreadsheet size={16} /> Скачать Excel</button></footer>
+        </section>
+      </div>}
+
+      {loginOpen && <div className="modal-backdrop" onMouseDown={(e) => e.target === e.currentTarget && setLoginOpen(false)}><div className="modal-card">
+        <button onClick={() => setLoginOpen(false)} className="icon-btn absolute right-4 top-4" aria-label="Закрыть"><X size={18} /></button>
+        <div className="mb-5 grid h-12 w-12 place-items-center rounded-xl bg-lime-400 text-zinc-950"><Activity /></div><h2 className="text-2xl font-black">С возвращением</h2><p className="mb-5 mt-1 text-sm text-zinc-500">Войдите, чтобы выбрать свою тренировку.</p>
+        <div className="google-login">
+          {googleClientId ? <><div ref={googleButtonRef} className="google-button" /><p>Войти или зарегистрироваться как клиент</p>{googleUnavailable && <p className="google-error">Не удалось загрузить Google Sign-In. Проверьте подключение к интернету.</p>}</> :
+            <div className="google-setup"><span className="google-g">G</span><div><strong>Вход через Google</strong><p>Добавьте GOOGLE_CLIENT_ID в .env, чтобы включить вход и регистрацию.</p></div></div>}
+        </div>
+        <div className="login-divider"><span />или по email<span /></div>
+        <form onSubmit={(e) => login(e)} className="space-y-3"><input className="field w-full" type="email" placeholder="Email" value={loginForm.email} onChange={(e) => setLoginForm({ ...loginForm, email: e.target.value })} required /><input className="field w-full" type="password" placeholder="Пароль" value={loginForm.password} onChange={(e) => setLoginForm({ ...loginForm, password: e.target.value })} required /><button className="w-full rounded-xl bg-lime-400 py-3 font-bold text-zinc-950 hover:bg-lime-300">Войти</button></form>
+        <div className="my-4 flex items-center gap-2 text-[10px] uppercase tracking-wider text-zinc-600"><span className="h-px flex-1 bg-zinc-800" />Быстрый демо-вход<span className="h-px flex-1 bg-zinc-800" /></div><div className="grid grid-cols-2 gap-2"><button className="rounded-xl border border-white/10 py-2.5 text-xs font-semibold hover:bg-white/5" onClick={(e) => login(e, "client")}>Войти как клиент</button><button className="rounded-xl border border-white/10 py-2.5 text-xs font-semibold hover:bg-white/5" onClick={(e) => login(e, "admin")}>Войти как админ</button></div>
+      </div></div>}
       {toast && <div role="status" className="toast"><span className="grid h-7 w-7 place-items-center rounded-lg bg-lime-400/15 text-lime-300"><Check size={16} /></span>{toast}<button onClick={() => setToast("")} className="ml-2 text-zinc-500"><X size={15} /></button></div>}
     </div>
   );

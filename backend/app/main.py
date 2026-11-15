@@ -1,23 +1,33 @@
 import csv
 import io
+import secrets
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
 from typing import Annotated
 
 import bcrypt
 import redis.asyncio as redis
+import requests
+from fastapi.concurrency import run_in_threadpool
 from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response as FastAPIResponse, StreamingResponse
+from google.auth.exceptions import GoogleAuthError
+from google.auth.transport.requests import Request as GoogleRequest
+from google.oauth2 import id_token
 from jose import JWTError, jwt
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
+from openpyxl import Workbook
+from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.utils import get_column_letter
+from openpyxl.worksheet.table import Table, TableStyleInfo
 
 from app.db import SessionLocal
 from app.models import Booking, Notification, Trainer, User, Workout
-from app.schemas import LoginInput, NotificationOut, UserOut, UserUpdate, WorkoutCreate
+from app.schemas import GoogleLoginInput, LoginInput, NotificationOut, UserOut, UserUpdate, WorkoutCreate
 from app.seed import seed_database
 from app.settings import settings
 
@@ -108,7 +118,8 @@ OptionalUser = Annotated[User | None, Depends(optional_user)]
 
 async def invalidate_caches() -> None:
     if cache:
-        await cache.delete(f"workouts:{date.today().isoformat()}", f"report:{date.today().isoformat()}")
+        today = date.today().isoformat()
+        await cache.delete(f"workouts:{today}", f"report-data:{today}", f"report-csv:v2:{today}")
 
 
 async def admin_user(user: CurrentUser) -> User:
@@ -137,6 +148,48 @@ async def login(data: LoginInput, session: DbSession):
     user = await session.scalar(select(User).where(User.email == data.email.lower()))
     if not user or not bcrypt.checkpw(data.password.encode(), user.password_hash.encode()):
         raise HTTPException(status_code=401, detail="Неверный email или пароль")
+    return {"access_token": create_token(user), "token_type": "bearer", "user": UserOut.model_validate(user)}
+
+
+@app.post("/api/auth/google")
+async def google_login(data: GoogleLoginInput, session: DbSession):
+    if not settings.google_client_id:
+        raise HTTPException(status_code=503, detail="Вход через Google пока не настроен")
+    try:
+        claims = await run_in_threadpool(
+            id_token.verify_oauth2_token,
+            data.credential,
+            GoogleRequest(),
+            settings.google_client_id,
+        )
+    except (GoogleAuthError, ValueError, requests.exceptions.RequestException):
+        raise HTTPException(status_code=401, detail="Не удалось подтвердить аккаунт Google") from None
+
+    email = claims.get("email", "").lower()
+    full_name = claims.get("name", "").strip()
+    if not email or not full_name or claims.get("email_verified") is not True:
+        raise HTTPException(status_code=401, detail="Google не подтвердил адрес электронной почты")
+
+    user = await session.scalar(select(User).where(User.email == email))
+    if user and user.role != "client":
+        raise HTTPException(status_code=403, detail="Вход администратора через Google запрещен")
+    if not user:
+        user = User(
+            full_name=full_name[:120],
+            email=email,
+            phone="",
+            password_hash=bcrypt.hashpw(secrets.token_urlsafe(32).encode(), bcrypt.gensalt()).decode(),
+            membership="Стандарт",
+            role="client",
+        )
+        session.add(user)
+        try:
+            await session.commit()
+        except IntegrityError:
+            await session.rollback()
+            user = await session.scalar(select(User).where(User.email == email))
+            if not user or user.role != "client":
+                raise HTTPException(status_code=409, detail="Не удалось создать клиентский аккаунт") from None
     return {"access_token": create_token(user), "token_type": "bearer", "user": UserOut.model_validate(user)}
 
 
@@ -318,9 +371,203 @@ async def create_workout(data: WorkoutCreate, session: DbSession, _: AdminUser):
     return {"message": "Тренировка добавлена", "id": workout.id}
 
 
+async def build_report(session: AsyncSession) -> dict:
+    total_bookings = await session.scalar(select(func.count(Booking.id)).where(Booking.status == "confirmed"))
+    total_clients = await session.scalar(select(func.count(User.id)).where(User.role == "client"))
+    total_trainers = await session.scalar(select(func.count(Trainer.id)))
+    total_workouts = await session.scalar(select(func.count(Workout.id)).where(Workout.date >= date.today()))
+
+    trainer_workouts = (
+        select(
+            Workout.trainer_id.label("trainer_id"),
+            func.count(Workout.id).label("training_count"),
+            func.coalesce(func.sum(Workout.capacity), 0).label("capacity"),
+        )
+        .where(Workout.date >= date.today())
+        .group_by(Workout.trainer_id)
+        .subquery()
+    )
+    trainer_bookings = (
+        select(Workout.trainer_id.label("trainer_id"), func.count(Booking.id).label("booking_count"))
+        .join(Workout, Workout.id == Booking.workout_id)
+        .where(Workout.date >= date.today(), Booking.status == "confirmed")
+        .group_by(Workout.trainer_id)
+        .subquery()
+    )
+    trainer_rows = (
+        await session.execute(
+            select(
+                Trainer.full_name,
+                func.coalesce(trainer_workouts.c.training_count, 0),
+                func.coalesce(trainer_bookings.c.booking_count, 0),
+                func.coalesce(trainer_workouts.c.capacity, 0),
+            )
+            .outerjoin(trainer_workouts, trainer_workouts.c.trainer_id == Trainer.id)
+            .outerjoin(trainer_bookings, trainer_bookings.c.trainer_id == Trainer.id)
+            .order_by(func.coalesce(trainer_bookings.c.booking_count, 0).desc(), Trainer.full_name)
+        )
+    ).all()
+    sport_workouts = (
+        select(
+            Workout.sport.label("sport"),
+            func.count(Workout.id).label("training_count"),
+            func.coalesce(func.sum(Workout.capacity), 0).label("capacity"),
+        )
+        .where(Workout.date >= date.today())
+        .group_by(Workout.sport)
+        .subquery()
+    )
+    sport_bookings = (
+        select(Workout.sport.label("sport"), func.count(Booking.id).label("booking_count"))
+        .join(Workout, Workout.id == Booking.workout_id)
+        .where(Workout.date >= date.today(), Booking.status == "confirmed")
+        .group_by(Workout.sport)
+        .subquery()
+    )
+    sport_rows = (
+        await session.execute(
+            select(
+                sport_workouts.c.sport,
+                sport_workouts.c.training_count,
+                func.coalesce(sport_bookings.c.booking_count, 0),
+                sport_workouts.c.capacity,
+            )
+            .outerjoin(sport_bookings, sport_bookings.c.sport == sport_workouts.c.sport)
+            .order_by(func.coalesce(sport_bookings.c.booking_count, 0).desc(), sport_workouts.c.sport)
+        )
+    ).all()
+    workout_rows = (
+        await session.execute(
+            select(Workout)
+            .options(selectinload(Workout.trainer), selectinload(Workout.bookings))
+            .where(Workout.date >= date.today())
+            .order_by(Workout.date, Workout.start_time)
+        )
+    ).scalars().unique().all()
+    schedule = []
+    for workout in workout_rows:
+        booked = sum(booking.status == "confirmed" for booking in workout.bookings)
+        schedule.append({
+            "date": workout.date.isoformat(),
+            "time": workout.start_time.strftime("%H:%M"),
+            "sport": workout.sport,
+            "title": workout.title,
+            "trainer": workout.trainer.full_name,
+            "booked": booked,
+            "capacity": workout.capacity,
+            "available": max(0, workout.capacity - booked),
+            "difficulty": workout.difficulty,
+        })
+    return {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "summary": {
+            "total_bookings": total_bookings or 0,
+            "total_clients": total_clients or 0,
+            "total_trainers": total_trainers or 0,
+            "total_workouts": total_workouts or 0,
+        },
+        "trainers": [
+            {"name": name, "training_count": trainings, "bookings": bookings, "capacity": capacity, "available": max(0, capacity - bookings)}
+            for name, trainings, bookings, capacity in trainer_rows
+        ],
+        "sports": [
+            {"name": name, "training_count": trainings, "bookings": bookings, "capacity": capacity, "available": max(0, capacity - bookings)}
+            for name, trainings, bookings, capacity in sport_rows
+        ],
+        "schedule": schedule,
+    }
+
+
+@app.get("/api/admin/report")
+async def report_data(session: DbSession, _: AdminUser):
+    cache_key = f"report-data:{date.today().isoformat()}"
+    if cache:
+        cached_report = await cache.get(cache_key)
+        if cached_report:
+            import json
+
+            return json.loads(cached_report)
+    report = await build_report(session)
+    if cache:
+        import json
+
+        await cache.set(cache_key, json.dumps(report, ensure_ascii=False), ex=60)
+    return report
+
+
+def build_report_workbook(report: dict) -> bytes:
+    workbook = Workbook()
+    sheets = [
+        ("Сводка", ["Показатель", "Значение"], [
+            ["Отчет сформирован", report["generated_at"]],
+            ["Активных записей", report["summary"]["total_bookings"]],
+            ["Клиентов", report["summary"]["total_clients"]],
+            ["Тренеров", report["summary"]["total_trainers"]],
+            ["Тренировок в расписании", report["summary"]["total_workouts"]],
+        ]),
+        ("По тренерам", ["Тренер", "Занятий", "Записей", "Всего мест", "Свободно мест"], [
+            [row["name"], row["training_count"], row["bookings"], row["capacity"], row["available"]]
+            for row in report["trainers"]
+        ]),
+        ("Направления", ["Направление", "Занятий", "Записей", "Всего мест", "Свободно мест"], [
+            [row["name"], row["training_count"], row["bookings"], row["capacity"], row["available"]]
+            for row in report["sports"]
+        ]),
+        ("Расписание", ["Дата", "Время", "Направление", "Тренировка", "Тренер", "Записано", "Вместимость", "Свободно", "Уровень"], [
+            [row["date"], row["time"], row["sport"], row["title"], row["trainer"], row["booked"], row["capacity"], row["available"], row["difficulty"]]
+            for row in report["schedule"]
+        ]),
+    ]
+    for index, (title, headers, rows) in enumerate(sheets):
+        sheet = workbook.active if index == 0 else workbook.create_sheet()
+        sheet.title = title
+        sheet.append([f"SPORTCLUB · {title.upper()}"])
+        sheet.merge_cells(start_row=1, start_column=1, end_row=1, end_column=len(headers))
+        sheet["A1"].font = Font(name="Aptos Display", size=16, bold=True, color="FFFFFF")
+        sheet["A1"].fill = PatternFill("solid", fgColor="172554")
+        sheet["A1"].alignment = Alignment(vertical="center")
+        sheet.row_dimensions[1].height = 32
+        sheet.append(headers)
+        for row in rows:
+            sheet.append([safe_spreadsheet_value(value) for value in row])
+        for cell in sheet[2]:
+            cell.font = Font(bold=True, color="FFFFFF")
+            cell.fill = PatternFill("solid", fgColor="65A30D")
+            cell.alignment = Alignment(vertical="center", wrap_text=True)
+        sheet.freeze_panes = "A3"
+        sheet.auto_filter.ref = f"A2:{sheet.cell(row=max(2, sheet.max_row), column=len(headers)).coordinate}"
+        if rows:
+            table = Table(displayName=f"ReportTable{index + 1}", ref=f"A2:{sheet.cell(row=sheet.max_row, column=len(headers)).coordinate}")
+            table.tableStyleInfo = TableStyleInfo(name="TableStyleMedium4", showFirstColumn=False, showLastColumn=False, showRowStripes=True, showColumnStripes=False)
+            sheet.add_table(table)
+        for column_index, column in enumerate(sheet.columns, start=1):
+            column_letter = get_column_letter(column_index)
+            width = max((len(str(cell.value or "")) for cell in column), default=10)
+            sheet.column_dimensions[column_letter].width = min(max(width + 3, 14), 42)
+    buffer = io.BytesIO()
+    workbook.save(buffer)
+    return buffer.getvalue()
+
+
+def safe_spreadsheet_value(value):
+    if isinstance(value, str) and value.startswith(("=", "+", "-", "@", "\t", "\r")):
+        return f"'{value}"
+    return value
+
+
+@app.get("/api/admin/report.xlsx")
+async def report_xlsx(session: DbSession, _: AdminUser):
+    report = await build_report(session)
+    return FastAPIResponse(
+        content=build_report_workbook(report),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": 'attachment; filename="sport-center-report.xlsx"'},
+    )
+
+
 @app.get("/api/admin/report.csv")
-async def report(session: DbSession, _: AdminUser):
-    cache_key = f"report:{date.today().isoformat()}"
+async def report_csv(session: DbSession, _: AdminUser):
+    cache_key = f"report-csv:v2:{date.today().isoformat()}"
     if cache:
         cached_report = await cache.get(cache_key)
         if cached_report:
@@ -329,30 +576,17 @@ async def report(session: DbSession, _: AdminUser):
                 media_type="text/csv; charset=utf-8",
                 headers={"Content-Disposition": 'attachment; filename="sport-center-report.csv"'},
             )
-    trainer_rows = (
-        await session.execute(
-            select(Trainer.full_name, func.count(Booking.id))
-            .join(Workout, Workout.trainer_id == Trainer.id)
-            .outerjoin(Booking, (Booking.workout_id == Workout.id) & (Booking.status == "confirmed"))
-            .group_by(Trainer.id, Trainer.full_name)
-            .order_by(func.count(Booking.id).desc())
-        )
-    ).all()
-    sport_rows = (
-        await session.execute(
-            select(Workout.sport, func.count(Booking.id))
-            .outerjoin(Booking, (Booking.workout_id == Workout.id) & (Booking.status == "confirmed"))
-            .group_by(Workout.sport)
-            .order_by(func.count(Booking.id).desc())
-        )
-    ).all()
-    total = await session.scalar(select(func.count(Booking.id)).where(Booking.status == "confirmed"))
+    report = await build_report(session)
     output = io.StringIO()
-    writer = csv.writer(output)
-    writer.writerow(["Раздел", "Название", "Количество"])
-    writer.writerow(["Всего активных записей", "Все направления", total or 0])
-    writer.writerows(["Записи по тренерам", name, count] for name, count in trainer_rows)
-    writer.writerows(["Популярные направления", sport, count] for sport, count in sport_rows)
+    writer = csv.writer(output, delimiter=";")
+    writer.writerow(["Раздел", "Название", "Занятий", "Записей", "Всего мест", "Свободно мест"])
+    writer.writerow(["Сводка", "Активные записи", "", report["summary"]["total_bookings"], "", ""])
+    writer.writerow(["Сводка", "Клиенты", "", report["summary"]["total_clients"], "", ""])
+    writer.writerow(["Сводка", "Тренеры", "", report["summary"]["total_trainers"], "", ""])
+    writer.writerow(["Сводка", "Занятия в расписании", report["summary"]["total_workouts"], "", "", ""])
+    writer.writerows([safe_spreadsheet_value(value) for value in ["Загрузка тренеров", row["name"], row["training_count"], row["bookings"], row["capacity"], row["available"]]] for row in report["trainers"])
+    writer.writerows([safe_spreadsheet_value(value) for value in ["Популярность направлений", row["name"], row["training_count"], row["bookings"], row["capacity"], row["available"]]] for row in report["sports"])
+    writer.writerows([safe_spreadsheet_value(value) for value in ["Расписание", f'{row["date"]} {row["time"]} · {row["title"]} · {row["trainer"]}', 1, row["booked"], row["capacity"], row["available"]]] for row in report["schedule"])
     content = "\ufeff" + output.getvalue()
     if cache:
         await cache.set(cache_key, content, ex=60)

@@ -7,6 +7,7 @@ class Settings(BaseSettings):
     jwt_secret: str = "local-development-change-this-secret"
     access_token_minutes: int = 720
     cors_origins: str = "http://localhost:3000"
+    google_client_id: str = ""
 
     model_config = SettingsConfigDict(case_sensitive=False)
 

@@ -12,6 +12,10 @@ class GoogleLoginInput(BaseModel):
     credential: str = Field(min_length=20, max_length=8192)
 
 
+class GoogleExchangeInput(BaseModel):
+    code: str = Field(min_length=32, max_length=128)
+
+
 class UserOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 

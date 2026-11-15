@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import {
   Activity, ArrowRight, Bell, CalendarDays, Check, ChevronDown, Clock3, Download,
   Dumbbell, FileSpreadsheet, LogOut, Menu, Plus, ShieldCheck, Waves, X, Zap,
@@ -13,27 +14,57 @@ const googleClientId = import.meta.env.VITE_GOOGLE_CLIENT_ID || "";
 function SelectField({ value, options, onChange, className = "", placeholder = "Выберите" }) {
   const [open, setOpen] = useState(false);
   const rootRef = useRef(null);
+  const triggerRef = useRef(null);
+  const menuRef = useRef(null);
+  const [menuPosition, setMenuPosition] = useState(null);
   const selected = options.find((option) => String(option.value) === String(value));
 
   useEffect(() => {
     if (!open) return undefined;
     const closeOnOutsideClick = (event) => {
-      if (!rootRef.current?.contains(event.target)) setOpen(false);
+      if (!rootRef.current?.contains(event.target) && !menuRef.current?.contains(event.target)) setOpen(false);
     };
+    const closeOnViewportChange = () => setOpen(false);
     document.addEventListener("pointerdown", closeOnOutsideClick);
-    return () => document.removeEventListener("pointerdown", closeOnOutsideClick);
+    window.addEventListener("resize", closeOnViewportChange);
+    window.addEventListener("scroll", closeOnViewportChange, true);
+    return () => {
+      document.removeEventListener("pointerdown", closeOnOutsideClick);
+      window.removeEventListener("resize", closeOnViewportChange);
+      window.removeEventListener("scroll", closeOnViewportChange, true);
+    };
   }, [open]);
 
+  function toggleMenu() {
+    if (open) {
+      setOpen(false);
+      return;
+    }
+    const bounds = triggerRef.current.getBoundingClientRect();
+    const menuHeight = Math.min(options.length * 38 + 10, 230);
+    const spaceBelow = window.innerHeight - bounds.bottom;
+    const opensAbove = spaceBelow < menuHeight + 12 && bounds.top > spaceBelow;
+    const availableHeight = Math.max(60, opensAbove ? bounds.top - 16 : spaceBelow - 12);
+    const height = Math.min(menuHeight, availableHeight);
+    setMenuPosition({
+      left: Math.max(8, Math.min(bounds.left, window.innerWidth - bounds.width - 8)),
+      top: Math.max(8, Math.min(opensAbove ? bounds.top - height - 6 : bounds.bottom + 6, window.innerHeight - height - 8)),
+      width: Math.min(bounds.width, window.innerWidth - 16),
+      maxHeight: height,
+    });
+    setOpen(true);
+  }
+
   return <div ref={rootRef} className={`select-root ${open ? "select-root-open" : ""} ${className}`} onKeyDown={(event) => event.key === "Escape" && setOpen(false)}>
-    <button type="button" className={`field select-trigger ${open ? "select-trigger-open" : ""}`} aria-haspopup="listbox" aria-expanded={open} onClick={() => setOpen((current) => !current)}>
+    <button ref={triggerRef} type="button" className={`field select-trigger ${open ? "select-trigger-open" : ""}`} aria-haspopup="listbox" aria-expanded={open} onClick={toggleMenu}>
       <span className={selected ? "" : "select-placeholder"}>{selected?.label || placeholder}</span><ChevronDown size={16} className={`select-chevron ${open ? "select-chevron-open" : ""}`} />
     </button>
-    {open && <div className="select-menu" role="listbox">
+    {open && menuPosition && createPortal(<div ref={menuRef} className="select-menu" role="listbox" style={menuPosition}>
       {options.map((option) => <button key={option.value} type="button" role="option" aria-selected={String(option.value) === String(value)} className={`select-option ${String(option.value) === String(value) ? "select-option-active" : ""}`} onClick={() => { onChange(option.value); setOpen(false); }}>
         <span>{option.label}</span>{String(option.value) === String(value) && <Check size={15} />}
       </button>)}
       {!options.length && <span className="select-empty">Нет вариантов</span>}
-    </div>}
+    </div>, document.body)}
   </div>;
 }
 
@@ -347,7 +378,7 @@ function App() {
             <SelectField className="training-select" value={trainingForm.difficulty} onChange={(value) => setTrainingForm({ ...trainingForm, difficulty: value })} options={["Начальный", "Средний", "Продвинутый"].map((level) => ({ value: level, label: level }))} placeholder="Сложность" />
             <button className="rounded-xl bg-lime-400 px-4 py-2 text-sm font-bold text-zinc-950 hover:bg-lime-300">Добавить в расписание</button>
           </form></div>
-          <div className="panel overflow-hidden"><div className="flex items-center justify-between border-b border-white/5 p-5"><h2 className="font-bold">Пользователи</h2><span className="text-xs text-zinc-500">{users.length} записей</span></div><div className="overflow-x-auto"><table className="admin-table w-full min-w-[740px] text-left text-sm"><thead className="text-xs uppercase tracking-wider text-zinc-600"><tr><th className="px-5 py-3">ФИО / Email</th><th className="px-3 py-3">Телефон</th><th className="px-3 py-3">Абонемент</th><th className="px-3 py-3">Роль</th><th className="px-4 py-3">Действие</th></tr></thead><tbody>{users.map((person) => <tr key={person.id} className="border-t border-white/5"><td className="px-5 py-3"><div className="font-semibold">{savingUser?.id === person.id ? <input className="field w-40 py-1" value={savingUser.full_name} onChange={(e) => setSavingUser({ ...savingUser, full_name: e.target.value })} /> : person.full_name}</div><div className="text-xs text-zinc-500">{person.email}</div></td><td className="px-3 py-3 text-zinc-400">{savingUser?.id === person.id ? <input className="field w-32 py-1" value={savingUser.phone} onChange={(e) => setSavingUser({ ...savingUser, phone: e.target.value })} /> : person.phone}</td><td className="px-3 py-3"><select className="field py-1" value={savingUser?.id === person.id ? savingUser.membership : person.membership} onChange={(e) => savingUser?.id === person.id ? setSavingUser({ ...savingUser, membership: e.target.value }) : setSavingUser({ ...person, membership: e.target.value })}><option>Стандарт</option><option>Премиум</option><option>Утренний</option></select></td><td className="px-3 py-3"><select className="field py-1" value={savingUser?.id === person.id ? savingUser.role : person.role} onChange={(e) => setSavingUser({ ...(savingUser?.id === person.id ? savingUser : person), role: e.target.value })}><option value="client">Клиент</option><option value="admin">Админ</option></select></td><td className="px-4 py-3"><button className="rounded-lg px-2 py-1 text-xs font-semibold text-lime-400 transition hover:bg-lime-400/10 hover:text-lime-300" onClick={() => savingUser?.id === person.id ? saveUser(savingUser) : setSavingUser({ ...person })}>{savingUser?.id === person.id ? "Сохранить" : "Изменить"}</button></td></tr>)}</tbody></table></div></div>
+          <div className="panel overflow-hidden"><div className="flex items-center justify-between border-b border-white/5 p-5"><h2 className="font-bold">Пользователи</h2><span className="text-xs text-zinc-500">{users.length} записей</span></div><div className="overflow-x-auto"><table className="admin-table w-full min-w-[740px] text-left text-sm"><thead className="text-xs uppercase tracking-wider text-zinc-600"><tr><th className="px-5 py-3">ФИО / Email</th><th className="px-3 py-3">Телефон</th><th className="px-3 py-3">Абонемент</th><th className="px-3 py-3">Роль</th><th className="px-4 py-3">Действие</th></tr></thead><tbody>{users.map((person) => <tr key={person.id} className="border-t border-white/5"><td className="px-5 py-3"><div className="font-semibold">{savingUser?.id === person.id ? <input className="field w-40 py-1" value={savingUser.full_name} onChange={(e) => setSavingUser({ ...savingUser, full_name: e.target.value })} /> : person.full_name}</div><div className="text-xs text-zinc-500">{person.email}</div></td><td className="px-3 py-3 text-zinc-400">{savingUser?.id === person.id ? <input className="field w-32 py-1" value={savingUser.phone} onChange={(e) => setSavingUser({ ...savingUser, phone: e.target.value })} /> : person.phone}</td><td className="px-3 py-3"><SelectField className="user-select" value={savingUser?.id === person.id ? savingUser.membership : person.membership} onChange={(value) => savingUser?.id === person.id ? setSavingUser({ ...savingUser, membership: value }) : setSavingUser({ ...person, membership: value })} options={["Стандарт", "Премиум", "Утренний"].map((membership) => ({ value: membership, label: membership }))} /></td><td className="px-3 py-3"><SelectField className="user-select" value={savingUser?.id === person.id ? savingUser.role : person.role} onChange={(value) => setSavingUser({ ...(savingUser?.id === person.id ? savingUser : person), role: value })} options={[{ value: "client", label: "Клиент" }, { value: "admin", label: "Админ" }]} /></td><td className="px-4 py-3"><button className="rounded-lg px-2 py-1 text-xs font-semibold text-lime-400 transition hover:bg-lime-400/10 hover:text-lime-300" onClick={() => savingUser?.id === person.id ? saveUser(savingUser) : setSavingUser({ ...person })}>{savingUser?.id === person.id ? "Сохранить" : "Изменить"}</button></td></tr>)}</tbody></table></div></div>
           <div className="mt-6 panel p-5"><div className="mb-4 flex items-center justify-between"><h2 className="font-bold">Записи клиентов — отмена администратором</h2><span className="rounded-full bg-zinc-800 px-2.5 py-1 text-xs text-zinc-400">{adminBookings.length} записей</span></div><div className="grid gap-3 md:grid-cols-2">{adminBookings.map((booking) => <div key={booking.id} className="booking-list-row"><span className="booking-date">{booking.date.split("-").reverse().join(".")} · {booking.start_time}</span><span className="booking-sport">{booking.sport}</span><span className="booking-name">{booking.user_name}</span><span className="booking-title">{booking.workout_title}</span><button className="booking-cancel" onClick={() => cancel(booking.id)}>Отменить</button></div>)}</div>{adminBookings.length === 0 && <p className="empty-state">Активных записей нет.</p>}<p className="mt-3 text-xs text-zinc-600">Клиент получит уведомление в личном кабинете после отмены.</p></div>
         </section>}
       </main>
@@ -382,7 +413,7 @@ function App() {
         <div className="mb-5 grid h-12 w-12 place-items-center rounded-xl bg-lime-400 text-zinc-950"><Activity /></div><h2 className="text-2xl font-black">С возвращением</h2><p className="mb-5 mt-1 text-sm text-zinc-500">Войдите, чтобы выбрать свою тренировку.</p>
         <div className="google-login">
           {googleClientId ? <><div ref={googleButtonRef} className="google-button" /><p>Войти или зарегистрироваться как клиент</p>{googleUnavailable && <p className="google-error">Не удалось загрузить Google Sign-In. Проверьте подключение к интернету.</p>}</> :
-            <div className="google-setup"><span className="google-g">G</span><div><strong>Вход через Google</strong><p>Добавьте GOOGLE_CLIENT_ID в .env, чтобы включить вход и регистрацию.</p></div></div>}
+            <div className="google-setup"><span className="google-g">G</span><div><strong>Продолжить с Google</strong><p>Первый вход автоматически создаст клиентский аккаунт. Для подключения нужен Google OAuth Client ID.</p></div></div>}
         </div>
         <div className="login-divider"><span />или по email<span /></div>
         <form onSubmit={(e) => login(e)} className="space-y-3"><input className="field w-full" type="email" placeholder="Email" value={loginForm.email} onChange={(e) => setLoginForm({ ...loginForm, email: e.target.value })} required /><input className="field w-full" type="password" placeholder="Пароль" value={loginForm.password} onChange={(e) => setLoginForm({ ...loginForm, password: e.target.value })} required /><button className="w-full rounded-xl bg-lime-400 py-3 font-bold text-zinc-950 hover:bg-lime-300">Войти</button></form>

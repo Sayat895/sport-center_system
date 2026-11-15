@@ -31,13 +31,13 @@ button { cursor: pointer; }
 .field:focus { border-color: rgba(163,230,53,.55); box-shadow: 0 0 0 3px rgba(163,230,53,.08); }
 .field option { background: #18181b; color: #e4e4e7; }
 .select-root { position: relative; min-width: 0; width: 100%; }
-.select-root-open { z-index: 45; }
+.user-select { min-width: 118px; }
 .select-trigger { display: flex; width: 100%; align-items: center; justify-content: space-between; gap: 10px; text-align: left; }
 .select-trigger-open { border-color: rgba(163,230,53,.55); box-shadow: 0 0 0 3px rgba(163,230,53,.08); }
 .select-placeholder { color: #71717a; }
 .select-chevron { flex: none; color: #a1a1aa; transition: transform .18s, color .18s; }
 .select-chevron-open { transform: rotate(180deg); color: #a3e635; }
-.select-menu { position: absolute; top: calc(100% + 6px); left: 0; z-index: 50; width: 100%; max-height: 230px; overflow-y: auto; border: 1px solid rgba(255,255,255,.09); border-radius: 12px; background: #18181b; padding: 5px; box-shadow: 0 16px 38px rgba(0,0,0,.55); animation: appear .12s ease; }
+.select-menu { position: fixed; z-index: 100; overflow-y: auto; border: 1px solid rgba(255,255,255,.09); border-radius: 12px; background: #18181b; padding: 5px; box-shadow: 0 16px 38px rgba(0,0,0,.55); animation: appear .12s ease; }
 .select-option { display: flex; width: 100%; align-items: center; justify-content: space-between; gap: 10px; border-radius: 8px; padding: 9px 10px; color: #d4d4d8; text-align: left; font-size: 12px; transition: background .15s, color .15s; }
 .select-option:hover { background: rgba(255,255,255,.06); color: white; }
 .select-option-active, .select-option-active:hover { background: rgba(163,230,53,.1); color: #bef264; }
@@ -48,9 +48,9 @@ button { cursor: pointer; }
 .google-button { display: flex; min-height: 42px; justify-content: center; }
 .google-login > p { margin: 7px 0 0; color: #71717a; font-size: 11px; text-align: center; }
 .google-login .google-error { color: #fca5a5; }
-.google-setup { display: flex; width: 100%; align-items: center; gap: 12px; border: 1px solid rgba(255,255,255,.08); border-radius: 12px; background: #18181b; padding: 11px 13px; }
+.google-setup { display: flex; width: 100%; align-items: center; gap: 12px; border: 1px solid rgba(255,255,255,.08); border-radius: 12px; background: #18181b; padding: 13px; }
 .google-g { display: grid; height: 32px; width: 32px; flex: none; place-items: center; border-radius: 9px; background: white; color: #4285f4; font-weight: 800; }
-.google-setup strong { font-size: 12px; }
+.google-setup strong { color: #e4e4e7; font-size: 12px; }
 .google-setup p { margin-top: 3px; color: #71717a; font-size: 10px; line-height: 1.4; }
 .login-divider { display: flex; align-items: center; gap: 10px; margin: 17px 0 13px; color: #71717a; font-size: 10px; }
 .login-divider span { height: 1px; flex: 1; background: #27272a; }

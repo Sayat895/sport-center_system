@@ -1,0 +1,56 @@
+services:
+  db:
+    image: postgres:15-alpine
+    restart: always
+    environment:
+      POSTGRES_DB: sport_center
+      POSTGRES_USER: sport
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-sport_dev_password}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sport -d sport_center"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: always
+    command: redis-server --appendonly yes
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  backend:
+    build: ./backend
+    restart: always
+    environment:
+      DATABASE_URL: postgresql+asyncpg://sport:${POSTGRES_PASSWORD:-sport_dev_password}@db:5432/sport_center
+      REDIS_URL: redis://redis:6379/0
+      JWT_SECRET: ${JWT_SECRET:-local-development-change-this-secret}
+      CORS_ORIGINS: http://localhost:3000,http://localhost:80
+      ACCESS_TOKEN_MINUTES: 720
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+
+  frontend:
+    build: ./frontend
+    restart: always
+    depends_on:
+      - backend
+    ports:
+      - "3000:80"
+
+volumes:
+  pgdata:
+  redisdata:
